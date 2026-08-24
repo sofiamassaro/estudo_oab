@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   BookOpen,
   Database,
@@ -83,6 +83,15 @@ const api = {
       body: JSON.stringify({ resolvida }),
     }).then((r) => r.json()),
   excluirNota: (id) => fetch(`/api/notas/${id}`, { method: "DELETE" }),
+
+    listarPosicoes: () =>
+    fetch("/api/posicoes").then((r) => r.json()).catch(() => ({})),
+  salvarPosicao: (dados) =>
+    fetch("/api/posicoes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dados),
+    }),
 };
 
 // -------------------------------------------------------------------
@@ -96,18 +105,21 @@ export default function App() {
   const [questoes, setQuestoes] = useState([]);
   const [respostas, setRespostas] = useState({});
   const [notas, setNotas] = useState([]);
+  const [posicoes, setPosicoes] = useState({});
 
   useEffect(() => {
     (async () => {
       try {
-        const [q, r, n] = await Promise.all([
+        const [q, r, n, p] = await Promise.all([
           api.listarQuestoes(),
           api.listarRespostas(),
           api.listarNotas(),
+          api.listarPosicoes(),
         ]);
         setQuestoes(Array.isArray(q) ? q : []);
         setRespostas(r && typeof r === "object" ? r : {});
         setNotas(Array.isArray(n) ? n : []);
+        setPosicoes(p && typeof p === "object" ? p : {});
       } catch {
         setErroConexao(true);
       } finally {
@@ -196,6 +208,8 @@ export default function App() {
             respostas={respostas}
             setRespostas={setRespostas}
             setNotas={setNotas}
+            posicoes={posicoes}
+            setPosicoes={setPosicoes}
           />
         )}
         {aba === "banco" && (
@@ -215,7 +229,7 @@ export default function App() {
 // -------------------------------------------------------------------
 // Aba: Estudar
 // -------------------------------------------------------------------
-function Estudar({ questoes, respostas, setRespostas, setNotas }) {
+function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPosicoes }) {
   const [eixo, setEixo] = useState("tema"); // "tema" | "exame"
   const [valorAtivo, setValorAtivo] = useState("Todos");
   const [indice, setIndice] = useState(0);
@@ -244,15 +258,48 @@ function Estudar({ questoes, respostas, setRespostas, setNotas }) {
     setValorAtivo("Todos");
   }
 
-  useEffect(() => {
-    setIndice(0);
-    setMostrarDuvida(false);
-    setTextoDuvida("");
-  }, [valorAtivo, eixo]);
+  const chavePos = (eixo, valor) => `${eixo}::${valor}`;
+  const primeiroSalvar = useRef(true);
 
+  // Ao trocar de tema/edição, volta para onde você parou (salvo no banco).
   useEffect(() => {
     setMostrarDuvida(false);
     setTextoDuvida("");
+
+    const total = filtradas.length;
+    if (total === 0) {
+      setIndice(0);
+      return;
+    }
+
+    let alvo = posicoes[chavePos(eixo, valorAtivo)];
+
+    // fallback: última questão já respondida neste filtro
+    if (alvo == null) {
+      alvo = 0;
+      for (let i = total - 1; i >= 0; i--) {
+        if (respostas[filtradas[i].id]) { alvo = i; break; }
+      }
+    }
+
+    setIndice(Math.min(Math.max(alvo, 0), total - 1));
+  }, [valorAtivo, eixo, filtradas.length]);
+
+  // Salva a posição atual no banco para retomar em qualquer dispositivo.
+  useEffect(() => {
+    setMostrarDuvida(false);
+    setTextoDuvida("");
+
+    // não salva no primeiro render (antes da posição ser restaurada)
+    if (primeiroSalvar.current) {
+      primeiroSalvar.current = false;
+      return;
+    }
+    if (filtradas.length === 0) return;
+
+    const chave = chavePos(eixo, valorAtivo);
+    setPosicoes((prev) => (prev[chave] === indice ? prev : { ...prev, [chave]: indice }));
+    api.salvarPosicao({ eixo, valor: valorAtivo, indice }).catch(() => {});
   }, [indice]);
 
   if (questoes.length === 0) {
