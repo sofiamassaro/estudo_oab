@@ -18,6 +18,10 @@ import {
   CircleHelp,
   CircleCheck,
   EyeOff,
+  ChevronsLeft,
+  Shuffle,
+  Eraser,
+  RotateCcw,
 } from "lucide-react";
 
 // -------------------------------------------------------------------
@@ -49,6 +53,52 @@ const TEMAS = [
 const LETRAS = ["A", "B", "C", "D"];
 
 // -------------------------------------------------------------------
+// Utilitários
+// -------------------------------------------------------------------
+
+// Preferência simples guardada no navegador (por dispositivo).
+function usePreferencia(chave, padrao) {
+  const [valor, setValor] = useState(padrao);
+  useEffect(() => {
+    try {
+      const salvo = localStorage.getItem(chave);
+      if (salvo !== null) setValor(JSON.parse(salvo));
+    } catch {
+      /* navegador sem localStorage: fica o padrão */
+    }
+  }, [chave]);
+  const atualizar = (novo) =>
+    setValor((prev) => {
+      const v = typeof novo === "function" ? novo(prev) : novo;
+      try {
+        localStorage.setItem(chave, JSON.stringify(v));
+      } catch {
+        /* ignora */
+      }
+      return v;
+    });
+  return [valor, atualizar];
+}
+
+// Embaralha sempre na mesma ordem para a mesma semente (Fisher-Yates + mulberry32).
+function embaralharComSemente(lista, semente) {
+  const arr = [...lista];
+  let s = semente >>> 0 || 1;
+  const rand = () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// -------------------------------------------------------------------
 // Camada de API
 // -------------------------------------------------------------------
 const api = {
@@ -67,6 +117,15 @@ const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(dados),
+    }),
+  apagarRespostas: (ids) =>
+    fetch("/api/respostas", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }).then((r) => {
+      if (!r.ok) throw new Error("falha ao apagar respostas");
+      return r.json();
     }),
 
   listarNotas: () => fetch("/api/notas").then((r) => r.json()),
@@ -236,6 +295,13 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
   const [mostrarDuvida, setMostrarDuvida] = useState(false);
   const [textoDuvida, setTextoDuvida] = useState("");
 
+  // Modo "tentar de novo": questões respondidas em outra sessão aparecem em branco.
+  const [ocultarRespondidas, setOcultarRespondidas] = usePreferencia("oab:ocultarRespondidas", true);
+  const [embaralhar, setEmbaralhar] = usePreferencia("oab:embaralhar", false);
+  const [semente, setSemente] = useState(() => Date.now());
+  // Questões cujo resultado você já viu nesta sessão (respondeu agora ou pediu para ver).
+  const [vistas, setVistas] = useState(() => new Set());
+
   const temasComQuestoes = useMemo(() => {
     const set = new Set(questoes.map((q) => q.tema));
     return TEMAS.filter((t) => set.has(t));
@@ -248,10 +314,15 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
 
   const opcoes = eixo === "tema" ? temasComQuestoes : examesComQuestoes;
 
-  const filtradas = useMemo(() => {
+  const filtradasBase = useMemo(() => {
     if (valorAtivo === "Todos") return questoes;
     return questoes.filter((q) => (eixo === "tema" ? q.tema : q.exame) === valorAtivo);
   }, [questoes, eixo, valorAtivo]);
+
+  const filtradas = useMemo(
+    () => (embaralhar ? embaralharComSemente(filtradasBase, semente) : filtradasBase),
+    [filtradasBase, embaralhar, semente]
+  );
 
   function trocarEixo(novo) {
     setEixo(novo);
@@ -272,6 +343,12 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
       return;
     }
 
+    // Ordem embaralhada sempre começa da 1ª (a posição salva vale para a ordem normal).
+    if (embaralhar) {
+      setIndice(0);
+      return;
+    }
+
     let alvo = posicoes[chavePos(eixo, valorAtivo)];
 
     // fallback: última questão já respondida neste filtro
@@ -283,7 +360,7 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
     }
 
     setIndice(Math.min(Math.max(alvo, 0), total - 1));
-  }, [valorAtivo, eixo, filtradas.length]);
+  }, [valorAtivo, eixo, filtradas.length, embaralhar, semente]);
 
   // Salva a posição atual no banco para retomar em qualquer dispositivo.
   useEffect(() => {
@@ -296,6 +373,8 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
       return;
     }
     if (filtradas.length === 0) return;
+    // No modo embaralhado não sobrescreve a posição da ordem normal.
+    if (embaralhar) return;
 
     const chave = chavePos(eixo, valorAtivo);
     setPosicoes((prev) => (prev[chave] === indice ? prev : { ...prev, [chave]: indice }));
@@ -314,11 +393,77 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
   const questao = filtradas[indice];
   const resp = questao ? respostas[questao.id] : null;
   const respondida = !!resp;
+  // Só mostra gabarito/cores se você respondeu nesta sessão, pediu para ver,
+  // ou desligou o "Ocultar respostas anteriores".
+  const mostrarResultado =
+    !!questao && respondida && (!ocultarRespondidas || vistas.has(questao.id));
+  const respondidasNoFiltro = filtradas.filter((q) => respostas[q.id]).length;
+
+  function marcarVista(id) {
+    setVistas((prev) => new Set(prev).add(id));
+  }
+
+  function tirarDasVistas(ids) {
+    setVistas((prev) => {
+      const s = new Set(prev);
+      ids.forEach((id) => s.delete(id));
+      return s;
+    });
+  }
+
+  function removerRespostasLocais(ids) {
+    setRespostas((prev) => {
+      const c = { ...prev };
+      ids.forEach((id) => delete c[id]);
+      return c;
+    });
+  }
+
+  function comecarDoInicio() {
+    if (embaralhar) setSemente(Date.now()); // nova ordem, como um simulado novo
+    setVistas(new Set()); // volta a esconder o que você viu nesta sessão
+    setIndice(0);
+  }
+
+  async function refazerQuestao() {
+    if (!window.confirm("Apagar sua resposta desta questão para respondê-la de novo?")) return;
+    const id = questao.id;
+    try {
+      await api.apagarRespostas([id]);
+    } catch {
+      window.alert("Não foi possível apagar a resposta. Tente novamente.");
+      return;
+    }
+    removerRespostasLocais([id]);
+    tirarDasVistas([id]);
+  }
+
+  async function zerarFiltro() {
+    const ids = filtradas.filter((q) => respostas[q.id]).map((q) => q.id);
+    if (ids.length === 0) return;
+    const nome = valorAtivo === "Todos" ? "todas as questões" : valorAtivo;
+    const ok = window.confirm(
+      `Apagar ${ids.length} ${ids.length === 1 ? "resposta" : "respostas"} de ${nome}?\n\n` +
+        "As questões e suas dúvidas continuam salvas. Só o histórico de respostas " +
+        "(e as estatísticas delas no Progresso) será apagado."
+    );
+    if (!ok) return;
+    try {
+      await api.apagarRespostas(ids);
+    } catch {
+      window.alert("Não foi possível apagar as respostas. Tente novamente.");
+      return;
+    }
+    removerRespostasLocais(ids);
+    tirarDasVistas(ids);
+    setIndice(0);
+  }
 
   async function responder(letra) {
-    if (respondida) return;
+    if (mostrarResultado) return;
     const acertou = letra === questao.correta;
     setRespostas((prev) => ({ ...prev, [questao.id]: { escolhida: letra, acertou } }));
+    marcarVista(questao.id);
     try {
       await api.registrarResposta({ questaoId: questao.id, escolhida: letra, acertou });
     } catch {
@@ -371,6 +516,37 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
             ))
           )}
         </div>
+
+        <div className="flex items-center gap-2 flex-wrap mt-3 pt-3 border-t border-slate-200">
+          <AcaoBtn onClick={comecarDoInicio} disabled={filtradas.length === 0} icone={ChevronsLeft}>
+            {embaralhar ? "Reiniciar (nova ordem)" : "Começar do início"}
+          </AcaoBtn>
+          <AcaoBtn
+            ativo={embaralhar}
+            onClick={() => setEmbaralhar((v) => !v)}
+            icone={Shuffle}
+            title="Mostra as questões do filtro em ordem aleatória"
+          >
+            Embaralhar
+          </AcaoBtn>
+          <AcaoBtn
+            ativo={ocultarRespondidas}
+            onClick={() => setOcultarRespondidas((v) => !v)}
+            icone={EyeOff}
+            title="Questões respondidas em outra sessão aparecem em branco para você tentar de novo"
+          >
+            Ocultar respostas anteriores
+          </AcaoBtn>
+          <AcaoBtn
+            onClick={zerarFiltro}
+            disabled={respondidasNoFiltro === 0}
+            icone={Eraser}
+            perigo
+            title="Apaga o histórico de respostas das questões deste filtro"
+          >
+            Zerar progresso ({respondidasNoFiltro})
+          </AcaoBtn>
+        </div>
       </div>
 
       {!questao ? (
@@ -389,12 +565,25 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
             <p className="text-slate-800 leading-relaxed whitespace-pre-wrap">{questao.enunciado}</p>
           </div>
 
+          {respondida && !mostrarResultado && (
+            <div className="mx-5 sm:mx-6 mb-3 flex items-center gap-2 flex-wrap text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+              <EyeOff size={14} className="shrink-0" />
+              <span>Você já respondeu esta questão antes. Tente lembrar antes de conferir.</span>
+              <button
+                onClick={() => marcarVista(questao.id)}
+                className="font-medium text-violet-600 hover:underline"
+              >
+                Ver minha resposta anterior
+              </button>
+            </div>
+          )}
+
           <div className="px-5 sm:px-6 pb-2 space-y-2">
             {questao.alternativas.map((alt) => {
               const escolhida = resp && resp.escolhida === alt.letra;
               const eCorreta = alt.letra === questao.correta;
               let cls = "border-slate-200 hover:border-violet-300 hover:bg-violet-50/40";
-              if (respondida) {
+              if (mostrarResultado) {
                 if (eCorreta) cls = "border-emerald-300 bg-emerald-50";
                 else if (escolhida) cls = "border-rose-300 bg-rose-50";
                 else cls = "border-slate-200 opacity-60";
@@ -403,23 +592,23 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
                 <button
                   key={alt.letra}
                   onClick={() => responder(alt.letra)}
-                  disabled={respondida}
+                  disabled={mostrarResultado}
                   className={`w-full text-left flex gap-3 items-start rounded-lg border px-4 py-3 transition-colors ${cls} ${
-                    respondida ? "cursor-default" : "cursor-pointer"
+                    mostrarResultado ? "cursor-default" : "cursor-pointer"
                   }`}
                 >
                   <span
                     className={`shrink-0 w-6 h-6 rounded-full grid place-items-center text-xs font-semibold ${
-                      respondida && eCorreta
+                      mostrarResultado && eCorreta
                         ? "bg-emerald-600 text-white"
-                        : respondida && escolhida
+                        : mostrarResultado && escolhida
                         ? "bg-rose-600 text-white"
                         : "bg-slate-100 text-slate-600"
                     }`}
                   >
-                    {respondida && eCorreta ? (
+                    {mostrarResultado && eCorreta ? (
                       <Check size={14} />
-                    ) : respondida && escolhida ? (
+                    ) : mostrarResultado && escolhida ? (
                       <X size={14} />
                     ) : (
                       alt.letra
@@ -431,9 +620,9 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
             })}
           </div>
 
-          {respondida && (
+          {mostrarResultado && (
             <div className="mx-5 sm:mx-6 mb-2 mt-3 rounded-lg bg-slate-50 border border-slate-200 px-4 py-3">
-              <div className="flex items-center gap-2 text-sm font-medium mb-1">
+              <div className="flex items-center gap-2 flex-wrap text-sm font-medium mb-1">
                 {resp.acertou ? (
                   <span className="text-emerald-700 flex items-center gap-1.5">
                     <CircleCheck size={16} /> Você acertou
@@ -443,6 +632,12 @@ function Estudar({ questoes, respostas, setRespostas, setNotas, posicoes, setPos
                     <X size={16} /> Gabarito: alternativa {questao.correta}
                   </span>
                 )}
+                <button
+                  onClick={refazerQuestao}
+                  className="ml-auto inline-flex items-center gap-1 whitespace-nowrap text-xs font-medium text-slate-500 hover:text-violet-700"
+                >
+                  <RotateCcw size={13} /> Refazer esta questão
+                </button>
               </div>
               {questao.comentario && (
                 <p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">
@@ -1032,6 +1227,25 @@ function Chip({ ativo, onClick, children }) {
           : "bg-white border-slate-200 text-slate-600 hover:border-violet-300"
       }`}
     >
+      {children}
+    </button>
+  );
+}
+
+// Botão da barra de ações do Estudar (pode funcionar como liga/desliga).
+function AcaoBtn({ ativo, onClick, disabled, icone: Icone, perigo, title, children }) {
+  let cls = "bg-white border-slate-200 text-slate-600 hover:border-slate-300";
+  if (ativo) cls = "bg-violet-50 border-violet-300 text-violet-700";
+  else if (perigo) cls = "bg-white border-slate-200 text-rose-600 hover:border-rose-300 hover:bg-rose-50/50";
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-pressed={ativo === undefined ? undefined : ativo}
+      className={`inline-flex items-center gap-1.5 text-xs sm:text-sm px-3 py-1.5 rounded-lg border transition-colors disabled:opacity-40 disabled:pointer-events-none ${cls}`}
+    >
+      {Icone && <Icone size={15} />}
       {children}
     </button>
   );
